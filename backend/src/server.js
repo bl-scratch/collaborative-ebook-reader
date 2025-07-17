@@ -54,8 +54,9 @@ function initializeDatabase() {
       db.run(`DROP TABLE IF EXISTS sessions`);
       db.run(`DROP TABLE IF EXISTS users`);
       db.run(`DROP TABLE IF EXISTS user_progress`);
+      db.run(`DROP TABLE IF EXISTS book_profiles`);
       
-      // Books table with ALL expected columns
+      // Books table with slug column
       db.run(`
         CREATE TABLE books (
           id TEXT PRIMARY KEY,
@@ -65,6 +66,7 @@ function initializeDatabase() {
           filepath TEXT NOT NULL,
           file_size INTEGER,
           session_id TEXT NOT NULL,
+          slug TEXT UNIQUE,
           created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
       `, (err) => {
@@ -72,7 +74,7 @@ function initializeDatabase() {
           console.log('Error creating books table:', err);
           return reject(err);
         }
-        console.log('✅ Created books table');
+        console.log('✅ Created books table with slug');
       });
       
       // Highlights table - support both Socket.io and HTTP API
@@ -144,7 +146,27 @@ function initializeDatabase() {
         console.log('✅ Created sessions table');
       });
       
-      // Users table with session tracking
+      // Book-specific profiles table
+      db.run(`
+        CREATE TABLE book_profiles (
+          id TEXT PRIMARY KEY,
+          book_id TEXT NOT NULL,
+          username TEXT NOT NULL,
+          color TEXT DEFAULT '#4ECDC4',
+          created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+          last_used DATETIME DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (book_id) REFERENCES books (id),
+          UNIQUE(book_id, username)
+        )
+      `, (err) => {
+        if (err) {
+          console.log('Error creating book_profiles table:', err);
+          return reject(err);
+        }
+        console.log('✅ Created book_profiles table');
+      });
+      
+      // Users table with session tracking (kept for socket.io compatibility)
       db.run(`
         CREATE TABLE users (
           id TEXT PRIMARY KEY,
@@ -171,6 +193,7 @@ function initializeDatabase() {
           username TEXT NOT NULL,
           progress REAL DEFAULT 0,
           chapter INTEGER DEFAULT 1,
+          created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
           last_updated DATETIME DEFAULT CURRENT_TIMESTAMP,
           FOREIGN KEY (book_id) REFERENCES books (id)
         )
@@ -218,7 +241,7 @@ const upload = multer({
 // Middleware
 app.use(helmet());
 app.use(cors({
-  origin: ["http://localhost:3000", "http://localhost:5173"], // Add both ports
+  origin: ["http://localhost:3000", "http://localhost:5173", "http://localhost:5174"], // Add both Vite ports
   credentials: true
 }));
 
@@ -268,6 +291,16 @@ function generateUserProfile() {
     username: `${adjective} ${animal}`,
     color: color
   };
+}
+
+// Add this function after generateUserProfile() (around line 258)
+function generateSlug() {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  let result = '';
+  for (let i = 0; i < 8; i++) {
+    result += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return result;
 }
 
 // API Routes
@@ -325,12 +358,16 @@ app.post('/api/upload', upload.single('epub'), async (req, res) => {
       console.log('⚠️  Using fallback title and author');
     }
     
+    // Generate unique slug
+    const slug = generateSlug();
+    console.log('🔗 Generated slug:', slug);
+    
     console.log('✅ Creating book with ID:', bookId);
     
-    // Insert book into database with session_id included
+    // Insert book into database with slug
     db.run(
-      'INSERT INTO books (id, title, filename, filepath, file_size, author, session_id) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      [bookId, title, req.file.filename, req.file.path, req.file.size, author, sessionId],
+      'INSERT INTO books (id, title, filename, filepath, file_size, author, session_id, slug) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      [bookId, title, req.file.filename, req.file.path, req.file.size, author, sessionId, slug],
       function(err) {
         if (err) {
           console.log('❌ Database error:', err);
@@ -356,7 +393,8 @@ app.post('/api/upload', upload.single('epub'), async (req, res) => {
               sessionId: sessionId,
               title: title,
               author: author,
-              filename: req.file.filename
+              filename: req.file.filename,
+              slug: slug
             };
             
             console.log('📤 Sending response:', response);
@@ -427,22 +465,26 @@ app.get('/api/book/:bookId/highlights', (req, res) => {
   });
 });
 
-// Get comments for a highlight
+// Get comments for a highlight - WITH JOIN (requires proper user_id)
 app.get('/api/highlight/:highlightId/comments', (req, res) => {
   const { highlightId } = req.params;
   
   db.all(`
-    SELECT c.*, u.username, u.color as user_color
+    SELECT c.id, c.book_id, c.user_id, c.username, c.chapter, c.text, c.comment, 
+           c.content, c.position, c.highlight_id, c.parent_id, c.created_at,
+           u.color as user_color
     FROM comments c
-    JOIN users u ON c.user_id = u.id
+    LEFT JOIN users u ON c.user_id = u.id
     WHERE c.highlight_id = ?
-    ORDER BY c.created_date ASC
+    ORDER BY c.created_at ASC
   `, [highlightId], (err, comments) => {
     if (err) {
+      console.log('❌ Database error getting comments:', err);
       return res.status(500).json({ error: 'Database error' });
     }
     
-    res.json(comments);
+    console.log('✅ Retrieved comments for highlight:', highlightId, 'comments:', comments);
+    res.json(comments || []);
   });
 });
 
@@ -1065,18 +1107,17 @@ function parseCalibreMetadata(output) {
 // Update the highlights POST endpoint
 app.post('/api/books/:bookId/highlights', (req, res) => {
   const { bookId } = req.params;
-  const { text, chapter, position, color, user_id, username } = req.body;
+  const { text, chapter, position, color, profile_id, username } = req.body;
   
-  if (!text || !chapter || !username) {
+  if (!text || !chapter || !profile_id || !username) {
     return res.status(400).json({ error: 'Missing required fields' });
   }
   
   const highlightId = uuidv4();
-  const userId = user_id || uuidv4();
   
   db.run(
     'INSERT INTO highlights (id, book_id, user_id, username, text, chapter, position, color, created_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)',
-    [highlightId, bookId, userId, username, text, chapter, position, color || '#ffeb3b'],
+    [highlightId, bookId, profile_id, username, text, chapter, position, color || '#ffeb3b'],
     function(err) {
       if (err) {
         console.log('❌ Database error creating highlight:', err);
@@ -1086,7 +1127,7 @@ app.post('/api/books/:bookId/highlights', (req, res) => {
       const newHighlight = {
         id: highlightId,
         book_id: bookId,
-        user_id: userId,
+        user_id: profile_id,
         username: username,
         text: text,
         chapter: chapter,
@@ -1159,18 +1200,17 @@ app.get('/api/books/:bookId/comments', (req, res) => {
 // Update the comments POST endpoint
 app.post('/api/books/:bookId/comments', (req, res) => {
   const { bookId } = req.params;
-  const { text, selectedText, chapter, position, highlightId, user_id, username } = req.body;
+  const { text, selectedText, chapter, position, highlightId, profile_id, username } = req.body;
   
-  if (!text || !selectedText || !chapter || !username) {
+  if (!text || !selectedText || !chapter || !profile_id || !username) {
     return res.status(400).json({ error: 'Missing required fields' });
   }
   
   const commentId = uuidv4();
-  const userId = user_id || uuidv4();
   
   db.run(
     'INSERT INTO comments (id, book_id, user_id, username, text, comment, chapter, position, highlight_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-    [commentId, bookId, userId, username, selectedText, text, chapter, position, highlightId || null],
+    [commentId, bookId, profile_id, username, selectedText, text, chapter, position, highlightId || null],
     function(err) {
       if (err) {
         console.log('❌ Database error creating comment:', err);
@@ -1180,7 +1220,7 @@ app.post('/api/books/:bookId/comments', (req, res) => {
       const newComment = {
         id: commentId,
         book_id: bookId,
-        user_id: userId,
+        user_id: profile_id,
         username: username,
         text: selectedText,
         comment: text,
@@ -1261,29 +1301,126 @@ app.get('/api/users', (req, res) => {
   });
 });
 
-// Add progress tracking endpoints
+// Profile management endpoints
+app.get('/api/books/:bookId/profiles', (req, res) => {
+  const { bookId } = req.params;
+  
+  db.all(
+    'SELECT id, username, color, created_at, last_used FROM book_profiles WHERE book_id = ? ORDER BY last_used DESC',
+    [bookId],
+    (err, profiles) => {
+      if (err) {
+        console.log('❌ Database error getting profiles:', err);
+        return res.status(500).json({ error: 'Database error' });
+      }
+      
+      console.log('✅ Retrieved profiles for book:', bookId, 'count:', profiles.length);
+      res.json({ profiles: profiles || [] });
+    }
+  );
+});
+
+app.post('/api/books/:bookId/profiles', (req, res) => {
+  const { bookId } = req.params;
+  const { username } = req.body;
+  
+  if (!username || username.trim().length === 0) {
+    return res.status(400).json({ error: 'Username is required' });
+  }
+  
+  if (username.length > 50) {
+    return res.status(400).json({ error: 'Username too long (max 50 characters)' });
+  }
+  
+  const profileId = uuidv4();
+  const colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7', '#DDA0DD', '#98D8C8', '#F7DC6F', '#BB8FCE', '#85C1E9'];
+  const randomColor = colors[Math.floor(Math.random() * colors.length)];
+  
+  db.run(
+    'INSERT INTO book_profiles (id, book_id, username, color) VALUES (?, ?, ?, ?)',
+    [profileId, bookId, username.trim(), randomColor],
+    function(err) {
+      if (err) {
+        if (err.code === 'SQLITE_CONSTRAINT' && err.message.includes('UNIQUE')) {
+          return res.status(409).json({ error: 'Username already exists for this book' });
+        }
+        console.log('❌ Database error creating profile:', err);
+        return res.status(500).json({ error: 'Failed to create profile' });
+      }
+      
+      const newProfile = {
+        id: profileId,
+        book_id: bookId,
+        username: username.trim(),
+        color: randomColor,
+        created_at: new Date().toISOString()
+      };
+      
+      console.log('✅ Created profile:', newProfile);
+      res.json(newProfile);
+    }
+  );
+});
+
+app.put('/api/books/:bookId/profiles/:profileId/use', (req, res) => {
+  const { bookId, profileId } = req.params;
+  
+  db.run(
+    'UPDATE book_profiles SET last_used = CURRENT_TIMESTAMP WHERE id = ? AND book_id = ?',
+    [profileId, bookId],
+    function(err) {
+      if (err) {
+        console.log('❌ Database error updating profile usage:', err);
+        return res.status(500).json({ error: 'Failed to update profile' });
+      }
+      
+      if (this.changes === 0) {
+        return res.status(404).json({ error: 'Profile not found' });
+      }
+      
+      console.log('✅ Updated profile last_used:', profileId);
+      res.json({ success: true });
+    }
+  );
+});
+
+// Add progress tracking endpoints (updated to use profile_id)
 app.post('/api/books/:bookId/progress', (req, res) => {
   const { bookId } = req.params;
-  const { user_id, username, progress, chapter } = req.body;
+  const { profile_id, username, progress, chapter } = req.body;
   
-  if (!user_id || !username || progress === undefined) {
+  if (!profile_id || !username || progress === undefined) {
     return res.status(400).json({ error: 'Missing required fields' });
   }
   
-  const progressId = `${bookId}_${user_id}`;
+  const progressId = `${bookId}_${profile_id}`;
   
+  // First try to insert (for new user), if exists then update
   db.run(
-    `INSERT OR REPLACE INTO user_progress (id, book_id, user_id, username, progress, chapter, last_updated) 
-     VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
-    [progressId, bookId, user_id, username, progress, chapter || 1],
+    `INSERT OR IGNORE INTO user_progress (id, book_id, user_id, username, progress, chapter, created_at, last_updated) 
+     VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+    [progressId, bookId, profile_id, username, progress, chapter || 1],
     function(err) {
       if (err) {
-        console.log('❌ Database error updating progress:', err);
+        console.log('❌ Database error inserting progress:', err);
         return res.status(500).json({ error: 'Failed to update progress' });
       }
       
-      console.log('✅ Updated progress for user:', username, 'progress:', progress);
-      res.json({ success: true });
+      // Then update the progress (preserving created_at)
+      db.run(
+        `UPDATE user_progress SET progress = ?, chapter = ?, username = ?, last_updated = CURRENT_TIMESTAMP 
+         WHERE id = ?`,
+        [progress, chapter || 1, username, progressId],
+        function(updateErr) {
+          if (updateErr) {
+            console.log('❌ Database error updating progress:', updateErr);
+            return res.status(500).json({ error: 'Failed to update progress' });
+          }
+          
+          console.log('✅ Updated progress for profile:', username, 'progress:', progress);
+          res.json({ success: true });
+        }
+      );
     }
   );
 });
@@ -1331,6 +1468,96 @@ app.get('/api/books/:bookId/progress/:userId', (req, res) => {
       res.json(user);
     }
   );
+});
+
+// Reading stats endpoints for scorecard
+app.get('/api/progress/:bookId/:profileId', (req, res) => {
+  const { bookId, profileId } = req.params;
+  
+  db.get(
+    `SELECT user_id, username, progress, chapter, last_updated,
+            (SELECT MIN(created_at) FROM user_progress WHERE book_id = ? AND user_id = ?) as first_session
+     FROM user_progress 
+     WHERE book_id = ? AND user_id = ?
+     ORDER BY last_updated DESC
+     LIMIT 1`,
+    [bookId, profileId, bookId, profileId],
+    (err, progress) => {
+      if (err) {
+        console.log('❌ Database error getting progress stats:', err);
+        return res.status(500).json({ error: 'Database error' });
+      }
+      
+      res.json(progress || { first_session: null, progress: 0 });
+    }
+  );
+});
+
+app.get('/api/highlights/:bookId', (req, res) => {
+  const { bookId } = req.params;
+  const { profile_id } = req.query;
+  
+  let query = 'SELECT * FROM highlights WHERE book_id = ?';
+  let params = [bookId];
+  
+  if (profile_id) {
+    query += ' AND user_id = ?';
+    params.push(profile_id);
+  }
+  
+  query += ' ORDER BY created_date DESC';
+  
+  db.all(query, params, (err, highlights) => {
+    if (err) {
+      console.error('Database error:', err);
+      return res.status(500).json({ error: 'Failed to load highlights' });
+    }
+    
+    res.json(highlights || []);
+  });
+});
+
+app.get('/api/comments/:bookId', (req, res) => {
+  const { bookId } = req.params;
+  const { profile_id } = req.query;
+  
+  let query = 'SELECT * FROM comments WHERE book_id = ?';
+  let params = [bookId];
+  
+  if (profile_id) {
+    query += ' AND user_id = ?';
+    params.push(profile_id);
+  }
+  
+  query += ' ORDER BY created_at DESC';
+  
+  db.all(query, params, (err, comments) => {
+    if (err) {
+      console.log('❌ Database error loading comments:', err);
+      return res.status(500).json({ error: 'Database error' });
+    }
+    
+    res.json(comments || []);
+  });
+});
+
+// Add this endpoint after the existing book endpoints (around line 410)
+app.get('/api/book/slug/:slug', (req, res) => {
+  const { slug } = req.params;
+  
+  db.get('SELECT * FROM books WHERE slug = ?', [slug], (err, book) => {
+    if (err) {
+      console.log('❌ Database error getting book by slug:', err);
+      return res.status(500).json({ error: 'Database error' });
+    }
+    if (!book) {
+      console.log('❌ Book not found for slug:', slug);
+      return res.status(404).json({ error: 'Book not found' });
+    }
+    
+    console.log('✅ Found book for slug:', slug, 'book:', book);
+    res.json(book);
+  });
 });
 
 // Error handling middleware

@@ -1,6 +1,12 @@
-import React, { useEffect, useState, useRef, useCallback } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
+import { useParams, useNavigate } from 'react-router-dom';
+import ProfileModal from './ProfileModal';
 
-function EPUBReader({ bookData }) {
+function EPUBReader() {
+  const { slug } = useParams();
+  const navigate = useNavigate();
+  
+  const [bookData, setBookData] = useState(null);
   const [bookContent, setBookContent] = useState(null);
   const [currentChapter, setCurrentChapter] = useState(0);
   const [isLoading, setIsLoading] = useState(true);
@@ -17,7 +23,6 @@ function EPUBReader({ bookData }) {
   const [highlights, setHighlights] = useState([]);
   const [comments, setComments] = useState([]);
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [userColor, setUserColor] = useState('#FFD700'); // Default user color
   const [selectedHighlightId, setSelectedHighlightId] = useState(null);
   const [highlightComments, setHighlightComments] = useState([]);
   const [showCommentsPopup, setShowCommentsPopup] = useState(false);
@@ -31,40 +36,99 @@ function EPUBReader({ bookData }) {
   const [lastProgressUpdate, setLastProgressUpdate] = useState(0);
   const PROGRESS_UPDATE_THROTTLE = 2000; // 2 seconds
 
-  // Generate username function
-  const generateUsername = () => {
-    const letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
-    const randomLetter = letters[Math.floor(Math.random() * letters.length)];
-    const randomNumber = Math.floor(Math.random() * 900) + 100; // 100-999
-    return `User ${randomLetter} ${randomNumber}`;
+
+
+  // Add profile state
+  const [currentProfile, setCurrentProfile] = useState(null);
+  const [currentUser, setCurrentUser] = useState(null);
+  const [showProfileModal, setShowProfileModal] = useState(false);
+
+  // Add scorecard state
+  const [readingStats, setReadingStats] = useState({
+    daysReading: 0,
+    totalReactions: 0
+  });
+
+  // Initialize profile on component mount
+  useEffect(() => {
+    if (bookData?.id) {
+      // Check if we have a stored profile for this book
+      const storedProfile = localStorage.getItem('current_profile');
+      
+      if (storedProfile) {
+        const profile = JSON.parse(storedProfile);
+        // Check if this profile is for the current book
+        if (profile.book_id === bookData.id) {
+          setCurrentProfile(profile);
+          setCurrentUser({
+            id: profile.id,
+            username: profile.username,
+            color: profile.color
+          });
+        } else {
+          // Different book, show profile modal
+          setShowProfileModal(true);
+        }
+      } else {
+        // No stored profile, show modal
+        setShowProfileModal(true);
+      }
+    }
+  }, [bookData?.id]);
+
+  // Profile selection handler
+  const handleProfileSelected = (profile) => {
+    setCurrentProfile(profile);
+    setCurrentUser({
+      id: profile.id,
+      username: profile.username,
+      color: profile.color
+    });
+    setShowProfileModal(false);
   };
 
-  // Add user state
-  const [currentUser, setCurrentUser] = useState(null);
-
-  // Initialize user on component mount
+  // Load book data by slug
   useEffect(() => {
-    if (!currentUser) {
-      const username = generateUsername();
-      setCurrentUser({ id: Date.now().toString(), username });
-      console.log('👤 Generated user:', username);
+    if (slug) {
+      loadBookBySlug();
     }
-  }, [currentUser]);
+  }, [slug]);
 
-  // Load book content
+  const loadBookBySlug = async () => {
+    try {
+      console.log('🔍 Loading book by slug:', slug);
+      const response = await fetch(`http://localhost:3001/api/book/slug/${slug}`);
+      
+      if (response.ok) {
+        const book = await response.json();
+        console.log('✅ Book loaded:', book);
+        setBookData(book);
+      } else {
+        console.error('❌ Failed to load book:', response.status);
+        setError('Book not found');
+        setIsLoading(false);
+      }
+    } catch (error) {
+      console.error('❌ Error loading book:', error);
+      setError('Failed to load book');
+      setIsLoading(false);
+    }
+  };
+
+  // Load book content when bookData is available
   useEffect(() => {
-    if (bookData?.bookId && !conversionInProgress.current) {
+    if (bookData?.id && !conversionInProgress.current) {
       conversionInProgress.current = true;
-      setConvertingBookId(bookData.bookId);
+      setConvertingBookId(bookData.id);
       loadBookContent();
     }
-  }, [bookData?.bookId]);
+  }, [bookData?.id]);
 
   const loadBookContent = async () => {
     try {
-      console.log('Converting EPUB using Calibre for book:', bookData.bookId);
+      console.log('Converting EPUB using Calibre for book:', bookData.id);
       
-      const response = await fetch(`http://localhost:3001/api/convert-epub/${bookData.bookId}`, {
+      const response = await fetch(`http://localhost:3001/api/convert-epub/${bookData.id}`, {
         method: 'POST'
       });
 
@@ -88,6 +152,24 @@ function EPUBReader({ bookData }) {
     } finally {
       conversionInProgress.current = false;
       setConvertingBookId(null);
+    }
+  };
+
+  // Add share function
+  const handleShare = () => {
+    const shareUrl = `${window.location.origin}/read/${slug}`;
+    
+    if (navigator.share) {
+      navigator.share({
+        title: bookData?.title || 'Collaborative Reading Session',
+        text: `Join me in reading "${bookData?.title}"`,
+        url: shareUrl
+      });
+    } else {
+      // Fallback: copy to clipboard
+      navigator.clipboard.writeText(shareUrl).then(() => {
+        alert('Link copied to clipboard!');
+      });
     }
   };
 
@@ -159,7 +241,7 @@ function EPUBReader({ bookData }) {
 
   // Send progress update to backend
   const sendProgressUpdate = async (progress) => {
-    if (!currentUser || !bookData?.bookId) return;
+    if (!currentProfile || !bookData?.id) return;
     
     const now = Date.now();
     if (now - lastProgressUpdate < PROGRESS_UPDATE_THROTTLE) {
@@ -169,14 +251,14 @@ function EPUBReader({ bookData }) {
     
     try {
       console.log('📤 Sending furthest progress update:', progress.toFixed(1) + '%');
-      const response = await fetch(`http://localhost:3001/api/books/${bookData.bookId}/progress`, {
+      const response = await fetch(`http://localhost:3001/api/books/${bookData.id}/progress`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json'
         },
         body: JSON.stringify({
-          user_id: currentUser.id,
-          username: currentUser.username,
+          profile_id: currentProfile.id,
+          username: currentProfile.username,
           progress: progress,
           chapter: currentChapter + 1
         })
@@ -195,10 +277,10 @@ function EPUBReader({ bookData }) {
 
   // Load other users' progress
   const loadUserProgress = async () => {
-    if (!bookData?.bookId) return;
+    if (!bookData?.id) return;
     
     try {
-      const response = await fetch(`http://localhost:3001/api/books/${bookData.bookId}/progress`);
+      const response = await fetch(`http://localhost:3001/api/books/${bookData.id}/progress`);
       if (response.ok) {
         const data = await response.json();
         setOtherUsers(data.users || []);
@@ -245,21 +327,67 @@ function EPUBReader({ bookData }) {
     const interval = setInterval(loadUserProgress, 10000);
     
     return () => clearInterval(interval);
-  }, [bookData?.bookId, currentChapter]); // Keep original dependencies
+  }, [bookData?.id, currentChapter]); // Keep original dependencies
+
+  // Add effect to load reading stats
+  useEffect(() => {
+    if (currentProfile?.id && bookData?.id) {
+      loadReadingStats();
+    }
+  }, [currentProfile?.id, bookData?.id, highlights.length, comments.length]);
+
+  const loadReadingStats = async () => {
+    try {
+      // Calculate days reading (from first progress update to now)
+      const progressResponse = await fetch(`http://localhost:3001/api/progress/${bookData.id}/${currentProfile.id}`);
+      const progressData = await progressResponse.json();
+      
+      // Calculate total reactions (highlights + comments)
+      const highlightsResponse = await fetch(`http://localhost:3001/api/highlights/${bookData.id}?profile_id=${currentProfile.id}`);
+      const highlightsData = await highlightsResponse.json();
+      
+      const commentsResponse = await fetch(`http://localhost:3001/api/comments/${bookData.id}?profile_id=${currentProfile.id}`);
+      const commentsData = await commentsResponse.json();
+      
+      // Calculate days reading
+      let daysReading = 1; // Default to 1 day for anyone with a profile
+      if (progressData.first_session) {
+        const firstSession = new Date(progressData.first_session);
+        const now = new Date();
+        const daysDiff = Math.floor((now - firstSession) / (1000 * 60 * 60 * 24));
+        daysReading = daysDiff + 1; // First day = 1, second day = 2, etc.
+      } else if (currentProfile.created_at) {
+        // If no progress yet, but user has a profile, calculate from profile creation
+        const profileCreated = new Date(currentProfile.created_at);
+        const now = new Date();
+        const daysDiff = Math.floor((now - profileCreated) / (1000 * 60 * 60 * 24));
+        daysReading = daysDiff + 1; // First day = 1, second day = 2, etc.
+      }
+      
+      const totalReactions = highlightsData.length + commentsData.length;
+      
+      setReadingStats({
+        daysReading,
+        totalReactions
+      });
+    } catch (error) {
+      console.error('Error loading reading stats:', error);
+    }
+  };
 
   // Handle highlight action
   const handleHighlight = async () => {
-    if (!selectedText.trim()) return;
+    if (!selectedText.trim() || !currentProfile) return;
     
     setIsSubmitting(true);
     
     try {
       console.log('🚀 Adding highlight for text:', selectedText);
-      console.log('📚 Book ID:', bookData.bookId);
+      console.log('📚 Book ID:', bookData.id);
       console.log(' Chapter:', currentChapter + 1);
       console.log(' Position:', window.getSelection().getRangeAt(0).startOffset);
       
-      const response = await fetch(`http://localhost:3001/api/books/${bookData.bookId}/highlights`, {
+      const response = await fetch(`http://localhost:3001/api/books/${bookData.id}/highlights`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json'
@@ -268,9 +396,9 @@ function EPUBReader({ bookData }) {
           text: selectedText,
           chapter: currentChapter + 1,
           position: window.getSelection().getRangeAt(0).startOffset,
-          color: userColor,
-          user_id: currentUser.id,
-          username: currentUser.username
+          color: currentProfile.color,
+          profile_id: currentProfile.id,
+          username: currentProfile.username
         })
       });
 
@@ -282,7 +410,7 @@ function EPUBReader({ bookData }) {
         setHighlights([...highlights, newHighlight]);
         
         // Visually highlight the text in the DOM
-        highlightTextInDOM(selectedText, userColor, false, newHighlight.id);
+        highlightTextInDOM(selectedText, currentProfile.color, false, newHighlight.id);
         
         clearSelection();
       } else {
@@ -303,13 +431,13 @@ function EPUBReader({ bookData }) {
 
   // Submit comment
   const handleSubmitComment = async () => {
-    if (!commentText.trim() || !selectedText.trim() || !currentUser) return;
+    if (!commentText.trim() || !selectedText.trim() || !currentProfile) return;
     
     setIsSubmitting(true);
     
     try {
       // First add highlight
-      const highlightResponse = await fetch(`http://localhost:3001/api/books/${bookData.bookId}/highlights`, {
+      const highlightResponse = await fetch(`http://localhost:3001/api/books/${bookData.id}/highlights`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json'
@@ -318,9 +446,9 @@ function EPUBReader({ bookData }) {
           text: selectedText,
           chapter: currentChapter + 1,
           position: window.getSelection().getRangeAt(0).startOffset,
-          color: userColor,
-          user_id: currentUser.id,
-          username: currentUser.username
+          color: currentProfile.color,
+          profile_id: currentProfile.id,
+          username: currentProfile.username
         })
       });
 
@@ -330,7 +458,7 @@ function EPUBReader({ bookData }) {
         setHighlights([...highlights, newHighlight]);
         
         // Then add comment
-        const commentResponse = await fetch(`http://localhost:3001/api/books/${bookData.bookId}/comments`, {
+        const commentResponse = await fetch(`http://localhost:3001/api/books/${bookData.id}/comments`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json'
@@ -341,8 +469,8 @@ function EPUBReader({ bookData }) {
             chapter: currentChapter + 1,
             position: window.getSelection().getRangeAt(0).startOffset,
             highlightId: newHighlight.id,
-            user_id: currentUser.id,
-            username: currentUser.username
+            profile_id: currentProfile.id,
+            username: currentProfile.username
           })
         });
 
@@ -352,7 +480,7 @@ function EPUBReader({ bookData }) {
           setComments([...comments, newComment]);
           
           // Visually highlight the text with star indicator
-          highlightTextInDOM(selectedText, userColor, true, newHighlight.id);
+          highlightTextInDOM(selectedText, currentProfile.color, true, newHighlight.id);
           
           clearSelection();
         } else {
@@ -473,9 +601,9 @@ function EPUBReader({ bookData }) {
 
   // Load highlights and comments for current chapter
   useEffect(() => {
-    if (bookData?.bookId) {
+    if (bookData?.id) {
       // Load highlights
-      fetch(`http://localhost:3001/api/books/${bookData.bookId}/highlights?chapter=${currentChapter + 1}`)
+      fetch(`http://localhost:3001/api/books/${bookData.id}/highlights?chapter=${currentChapter + 1}`)
         .then(res => res.json())
         .then(data => {
           console.log('📚 Loaded highlights:', data);
@@ -487,7 +615,7 @@ function EPUBReader({ bookData }) {
         });
       
       // Load comments
-      fetch(`http://localhost:3001/api/books/${bookData.bookId}/comments?chapter=${currentChapter + 1}`)
+      fetch(`http://localhost:3001/api/books/${bookData.id}/comments?chapter=${currentChapter + 1}`)
         .then(res => res.json())
         .then(data => {
           console.log(' Loaded comments:', data);
@@ -508,7 +636,7 @@ function EPUBReader({ bookData }) {
           setComments([]);
         });
     }
-  }, [bookData?.bookId, currentChapter]);
+  }, [bookData?.id, currentChapter]);
 
   const nextChapter = () => {
     if (bookContent && currentChapter < bookContent.chapters.length - 1) {
@@ -698,12 +826,38 @@ function EPUBReader({ bookData }) {
     );
   };
 
+  // Scorecard component
+  const ReadingScorecard = () => {
+    const progressPercent = Math.round(furthestProgress);
+    const progressBlocks = 10;
+    const filledBlocks = Math.floor((progressPercent / 100) * progressBlocks);
+    
+    const progressBar = '━'.repeat(filledBlocks) + '░'.repeat(progressBlocks - filledBlocks);
+    
+    return (
+      <div style={{
+        background: '#f8f9fa',
+        padding: '12px 15px',
+        borderBottom: '1px solid #e0e0e0',
+        fontFamily: 'monospace',
+        fontSize: '14px',
+        color: '#333'
+      }}>
+        <div>
+          👤 {currentProfile.username}
+        </div>
+        <div style={{ marginTop: '4px' }}>
+          {progressBar} {progressPercent}% • ⏰ {readingStats.daysReading} days • 💬 {readingStats.totalReactions} reactions
+        </div>
+      </div>
+    );
+  };
+
   if (isLoading) {
     return (
       <div style={{ textAlign: 'center', padding: '50px' }}>
-        <div>Converting EPUB to HTML using Calibre...</div>
-        <p>This may take a few moments for large books.</p>
-        <p>Book ID: {bookData?.bookId}</p>
+        <div>Loading book...</div>
+        {bookData && <p>Book: {bookData.title}</p>}
       </div>
     );
   }
@@ -711,43 +865,67 @@ function EPUBReader({ bookData }) {
   if (error) {
     return (
       <div style={{ textAlign: 'center', padding: '50px' }}>
-        <h2>Error Converting EPUB</h2>
+        <h2>Error</h2>
         <p>{error}</p>
-        <p>Book ID: {bookData?.bookId}</p>
-        <button onClick={() => window.location.reload()}>Try Again</button>
+        <button onClick={() => navigate('/')}>Back to Upload</button>
       </div>
     );
   }
 
   return (
     <div style={{ height: '100vh', display: 'flex', flexDirection: 'column' }}>
-      <div style={{ background: 'white', padding: '15px', borderBottom: '1px solid #e0e0e0' }}>
-        <h2>
-          {bookData?.title || 'EPUB Reader'}
-          {bookData?.author && bookData.author !== 'Unknown Author' && (
-            <span style={{ color: '#666', fontSize: '0.8em', fontWeight: 'normal' }}>
-              {' '}by {bookData.author}
-            </span>
-          )}
-        </h2>
-        {currentUser && (
-          <p style={{ margin: '5px 0', color: '#666', fontSize: '14px' }}>
-            👤 Reading as: <strong>{currentUser.username}</strong>
-          </p>
-        )}
-        <div style={{ display: 'flex', gap: '15px', alignItems: 'center' }}>
-          <button onClick={prevChapter} disabled={currentChapter === 0}>
-            ← Previous Chapter
-          </button>
-          <span>Chapter {currentChapter + 1} of {bookContent?.chapters?.length || 0}</span>
-          <button onClick={nextChapter} disabled={currentChapter >= (bookContent?.chapters?.length - 1) || 0}>
-            Next Chapter →
-          </button>
-        </div>
-      </div>
+      {showProfileModal && bookData?.id && (
+        <ProfileModal 
+          bookId={bookData.id}
+          onProfileSelected={handleProfileSelected}
+        />
+      )}
       
-      {/* Progress Bar */}
-      <ProgressBar />
+      {!showProfileModal && currentProfile && (
+        <>
+          {/* Book Header */}
+          <div style={{ background: 'white', padding: '15px', borderBottom: '1px solid #e0e0e0' }}>
+            <h2>
+              {bookData?.title || 'EPUB Reader'}
+              {bookData?.author && bookData.author !== 'Unknown Author' && (
+                <span style={{ color: '#666', fontSize: '0.8em', fontWeight: 'normal' }}>
+                  {' '}by {bookData.author}
+                </span>
+              )}
+            </h2>
+            <div style={{ display: 'flex', gap: '15px', alignItems: 'center' }}>
+              <button onClick={() => navigate('/')}>
+                ← Back to Upload
+              </button>
+              <button onClick={prevChapter} disabled={currentChapter === 0}>
+                ← Previous Chapter
+              </button>
+              <span>Chapter {currentChapter + 1} of {bookContent?.chapters?.length || 0}</span>
+              <button onClick={nextChapter} disabled={currentChapter >= (bookContent?.chapters?.length - 1) || 0}>
+                Next Chapter →
+              </button>
+              <button 
+                onClick={handleShare}
+                style={{
+                  background: '#4ECDC4',
+                  color: 'white',
+                  border: 'none',
+                  padding: '8px 16px',
+                  borderRadius: '4px',
+                  cursor: 'pointer',
+                  marginLeft: '10px'
+                }}
+              >
+                Share
+              </button>
+            </div>
+          </div>
+
+          {/* Reading Scorecard */}
+          <ReadingScorecard />
+      
+          {/* Progress Bar */}
+          <ProgressBar />
       
       <div style={{ flex: 1, overflow: 'auto', padding: '20px', backgroundColor: '#f9f9f9', position: 'relative' }}>
         {bookContent && bookContent.chapters[currentChapter] && (
@@ -907,8 +1085,9 @@ function EPUBReader({ bookData }) {
                     <div style={{ fontSize: '16px', marginBottom: '5px' }}>
                       "{highlight.text}"
                     </div>
-                    <div style={{ fontSize: '12px', color: '#999' }}>
-                      {new Date(highlight.created_date).toLocaleString()}
+                    <div style={{ fontSize: '12px', color: '#999', display: 'flex', justifyContent: 'space-between' }}>
+                      <span>by <strong>{highlight.username}</strong></span>
+                      <span>{new Date(highlight.created_date).toLocaleString()}</span>
                     </div>
                   </div>
                 ))}
@@ -923,13 +1102,14 @@ function EPUBReader({ bookData }) {
                     borderLeft: '3px solid #667eea'
                   }}>
                     <div style={{ fontSize: '14px', color: '#666', marginBottom: '5px' }}>
-                      "{comment.selected_text}"
+                      "{comment.selected_text || comment.text}"
                     </div>
                     <div style={{ fontSize: '16px', marginBottom: '5px' }}>
-                      {comment.text}
+                      {comment.comment || comment.text}
                     </div>
-                    <div style={{ fontSize: '12px', color: '#999' }}>
-                      {new Date(comment.created_date).toLocaleString()}
+                    <div style={{ fontSize: '12px', color: '#999', display: 'flex', justifyContent: 'space-between' }}>
+                      <span>by <strong>{comment.username}</strong></span>
+                      <span>{new Date(comment.created_date || comment.created_at).toLocaleString()}</span>
                     </div>
                   </div>
                 ))}
@@ -988,8 +1168,9 @@ function EPUBReader({ bookData }) {
                   <div style={{ fontSize: '16px', marginBottom: '5px' }}>
                     {comment.comment || comment.content}
                   </div>
-                  <div style={{ fontSize: '12px', color: '#999' }}>
-                    {new Date(comment.created_at || comment.created_date).toLocaleString()}
+                  <div style={{ fontSize: '12px', color: '#999', display: 'flex', justifyContent: 'space-between' }}>
+                    <span>by <strong>{comment.username}</strong></span>
+                    <span>{new Date(comment.created_at || comment.created_date).toLocaleString()}</span>
                   </div>
                 </div>
               ))}
@@ -1016,9 +1197,11 @@ function EPUBReader({ bookData }) {
         />
       )}
       
-      <div style={{ background: 'white', padding: '10px', borderTop: '1px solid #e0e0e0', textAlign: 'center' }}>
-        <p>Powered by Calibre - Professional EPUB conversion</p>
-      </div>
+          <div style={{ background: 'white', padding: '10px', borderTop: '1px solid #e0e0e0', textAlign: 'center' }}>
+            <p>Powered by Calibre - Professional EPUB conversion</p>
+          </div>
+        </>
+      )}
     </div>
   );
 }

@@ -1,9 +1,11 @@
 import React, { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 
-function UploadPage({ onBookUploaded }) {
+function UploadPage() {
   const [file, setFile] = useState(null);
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState('');
+  const navigate = useNavigate();
 
   const handleFileSelect = (event) => {
     const selectedFile = event.target.files[0];
@@ -51,9 +53,8 @@ function UploadPage({ onBookUploaded }) {
 
       if (response.ok) {
         console.log('✅ Upload successful:', data);
-        if (onBookUploaded) {
-          onBookUploaded(data);
-        }
+        // Redirect to the unique URL
+        navigate(`/read/${data.slug}`);
       } else {
         setError(data.error || 'Upload failed');
         console.log('❌ Upload failed:', data.error);
